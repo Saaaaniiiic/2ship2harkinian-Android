@@ -105,6 +105,7 @@ public class MainActivity extends SDLActivity{
         setupControllerOverlay();
         applyImmersiveFullscreen();
         attachController();
+        controllerAttached = true;
     }
 
     @Override
@@ -118,9 +119,21 @@ public class MainActivity extends SDLActivity{
     private native void nativeTestCrashReporter();
 
     @Override
+    protected void onPause() {
+        if (integratedTouchView != null) integratedTouchView.suspend();
+        super.onPause();
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
         applyImmersiveFullscreen();
+        if (integratedTouchView != null) integratedTouchView.resume();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (integratedTouchView == null || !integratedTouchView.cancelEditing()) super.onBackPressed();
     }
 
     @Override
@@ -977,8 +990,124 @@ public class MainActivity extends SDLActivity{
     private float rightStickStartX;
     private float rightStickStartY;
 
-    // Function to set up the controller overlay (inflate layout and initialize buttons)
+    // ---------------------------------------------------------------------------------------------
+    // Integrated touch overlay (N64 / GameCube / Modern presets, ported from the Ship of Harkinian port).
+    // IntegratedTouchView talks to the game through the methods below. For now they are carried by the
+    // virtual SDL gamepad; a later change replaces them with native hooks.
+    // ---------------------------------------------------------------------------------------------
+    private IntegratedTouchView integratedTouchView;
+    private volatile boolean controllerAttached;
+    private static final int TOUCH_STATE_READY = 1 << 25, TOUCH_STATE_IN_GAME = 2;
+    private static final int[] TOUCH_MASKS = {0x8000, 0x4000, 0x2000, 0x1000, 0x20, 0x10,
+            0x800, 0x400, 0x200, 0x100, 8, 4, 2, 1};
+    private int integratedHeldMasks;
+    private float integratedLookX, integratedLookY;
+
     private void setupControllerOverlay() {
+        View contentView = getContentView();
+        if (!(contentView instanceof ViewGroup)) {
+            Log.e("MainActivity", "SDL content view is unavailable; skipping controller overlay setup");
+            return;
+        }
+        ViewGroup view = (ViewGroup) contentView;
+        integratedTouchView = new IntegratedTouchView(this);
+        view.addView(integratedTouchView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        applyTouchControlsVisibility();
+    }
+
+    int integratedTouchState() { return TOUCH_STATE_READY | TOUCH_STATE_IN_GAME; }
+
+    int[] integratedTouchBindings(int mode) { return TouchBindings.defaults(mode); }
+
+    /** {sensitivity, vertical multiplier, invert X, invert Y, smoothing} */
+    float[] integratedTouchCamera() { return new float[]{1f, 1f, 0f, 0f, 0f}; }
+
+    void integratedTouchLayout(float[] anchors, boolean active, boolean naviUtilityIcon) {
+        // Item icons are drawn by the game itself in a later change.
+    }
+
+    void integratedMenuButton(int mask, boolean down) {
+        // The overlay never reports the menu as open yet; ImGui reads touches and the gamepad directly.
+    }
+
+    void integratedTouchButton(int mask, boolean down) {
+        if (mask == 0x20000) mask = 8; // Tatl is C-up
+        if (down) integratedHeldMasks |= mask; else integratedHeldMasks &= ~mask;
+        if (!controllerAttached) return;
+        switch (mask) {
+            case 0x8000: setButton(ControllerButtons.BUTTON_A, down); break;
+            case 0x4000: setButton(ControllerButtons.BUTTON_B, down); break;
+            case 0x2000: setButton(ControllerButtons.AXIS_LT, down); break;   // Z
+            case 0x10: setButton(ControllerButtons.AXIS_RT, down); break;     // R
+            case 0x20: setButton(ControllerButtons.BUTTON_LB, down); break;   // L
+            case 0x1000: setButton(ControllerButtons.BUTTON_START, down); break;
+            case 0x800: setButton(ControllerButtons.BUTTON_DPAD_UP, down); break;
+            case 0x400: setButton(ControllerButtons.BUTTON_DPAD_DOWN, down); break;
+            case 0x200: setButton(ControllerButtons.BUTTON_DPAD_LEFT, down); break;
+            case 0x100: setButton(ControllerButtons.BUTTON_DPAD_RIGHT, down); break;
+            case 8: case 4: case 2: case 1: updateIntegratedRightAxes(); break; // C buttons are the right stick
+            default: break; // Map, manual jump and modifiers wait for the game-side hooks
+        }
+    }
+
+    /** Left stick, -85..85 with up positive (the N64 stick range). */
+    void integratedTouchStick(int x, int y) {
+        if (!controllerAttached) return;
+        setAxis(ControllerButtons.AXIS_LX, (short) (Math.max(-85, Math.min(85, x)) * Short.MAX_VALUE / 85));
+        setAxis(ControllerButtons.AXIS_LY, (short) (-Math.max(-85, Math.min(85, y)) * Short.MAX_VALUE / 85));
+    }
+
+    /** Camera drag, -1..1 with down positive. */
+    void integratedLook(float x, float y, boolean active) {
+        integratedLookX = active ? Math.max(-1f, Math.min(1f, x)) : 0f;
+        integratedLookY = active ? Math.max(-1f, Math.min(1f, y)) : 0f;
+        updateIntegratedRightAxes();
+    }
+
+    // The default mapping reads C-left/right/up/down off the right stick, so a held C button wins over the camera drag.
+    private void updateIntegratedRightAxes() {
+        if (!controllerAttached) return;
+        int cx = ((integratedHeldMasks & 1) != 0 ? 1 : 0) - ((integratedHeldMasks & 2) != 0 ? 1 : 0);
+        int cy = ((integratedHeldMasks & 4) != 0 ? 1 : 0) - ((integratedHeldMasks & 8) != 0 ? 1 : 0);
+        short x, y;
+        if (cx != 0 || cy != 0) {
+            x = (short) (cx * Short.MAX_VALUE);
+            y = (short) (cy * Short.MAX_VALUE);
+        } else {
+            x = (short) (integratedLookX * Short.MAX_VALUE);
+            y = (short) (integratedLookY * Short.MAX_VALUE);
+        }
+        setAxis(ControllerButtons.AXIS_RX, x);
+        setAxis(ControllerButtons.AXIS_RY, y);
+    }
+
+    void integratedTouchReset() {
+        int held = integratedHeldMasks;
+        for (int mask : TOUCH_MASKS) if ((held & mask) != 0) integratedTouchButton(mask, false);
+        integratedHeldMasks = 0;
+        integratedLookX = integratedLookY = 0f;
+        integratedTouchStick(0, 0);
+        updateIntegratedRightAxes();
+    }
+
+    public void setIntegratedTouchFromNative(int mode, float scale, float opacity, boolean transparentSticks) {
+        preferences.edit().putInt("integratedTouchMode", Math.max(1, Math.min(3, mode)))
+                .putFloat("integratedTouchScale", scale).putFloat("integratedTouchOpacity", opacity)
+                .putBoolean("touchTransparentSticks", transparentSticks).apply();
+        runOnUiThread(this::applyTouchControlsVisibility);
+    }
+
+    public void editIntegratedTouchFromNative() {
+        runOnUiThread(() -> {
+            if (preferences.getBoolean(PREF_TOUCH_CONTROLS_DISABLED, false)) {
+                Toast.makeText(this, "Enable touch controls first.", Toast.LENGTH_LONG).show();
+            } else if (integratedTouchView != null) integratedTouchView.startEditing();
+        });
+    }
+
+    /** The first-generation overlay. Kept compiling but no longer used. */
+    private void setupLegacyControllerOverlay() {
         View contentView = getContentView();
         if (!(contentView instanceof ViewGroup)) {
             Log.e("MainActivity", "SDL content view is unavailable; skipping controller overlay setup");
@@ -1081,7 +1210,7 @@ public class MainActivity extends SDLActivity{
 
     public void setTouchLeftStickFloatingFromNative(boolean floating) {
         preferences.edit().putBoolean(PREF_TOUCH_LEFT_STICK_FLOATING, floating).apply();
-        runOnUiThread(this::applyTouchLeftStickMode);
+        runOnUiThread(() -> { applyTouchLeftStickMode(); applyTouchControlsVisibility(); });
     }
 
     private void applyTouchLeftStickMode() {
@@ -1158,6 +1287,18 @@ public class MainActivity extends SDLActivity{
     }
 
     private void applyTouchControlsVisibility() {
+        if (integratedTouchView != null) {
+            boolean touchControlsDisabled = preferences.getBoolean(PREF_TOUCH_CONTROLS_DISABLED, false);
+            int mode = preferences.getInt("integratedTouchMode", 3);
+            if (mode < 1 || mode > 3) mode = 3;
+            integratedTouchView.configure(mode, !touchControlsDisabled,
+                    preferences.getBoolean(PREF_TOUCH_LEFT_STICK_FLOATING, true),
+                    true, // the camera touch area is always floating
+                    preferences.getFloat("integratedTouchScale", 1),
+                    preferences.getFloat("integratedTouchOpacity", .55f),
+                    preferences.getBoolean("touchTransparentSticks", false));
+            return;
+        }
         if (overlayView == null) {
             return;
         }
@@ -1229,13 +1370,18 @@ public class MainActivity extends SDLActivity{
         });
     }
 
-    boolean TouchAreaEnabled = true;
+    volatile boolean TouchAreaEnabled = true;
 
+    // Called every frame from the ImGui thread, so only act on a change.
     void DisableTouchArea(){
+        if (!TouchAreaEnabled) return;
         TouchAreaEnabled = false;
+        runOnUiThread(() -> { if (integratedTouchView != null) integratedTouchView.setAreasEnabled(false); });
     }
     void EnableTouchArea(){
+        if (TouchAreaEnabled) return;
         TouchAreaEnabled = true;
+        runOnUiThread(() -> { if (integratedTouchView != null) integratedTouchView.setAreasEnabled(true); });
     }
 
     private void setupFloatingJoystick(FrameLayout touchArea) {
