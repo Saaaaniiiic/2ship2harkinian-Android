@@ -1018,10 +1018,21 @@ public class MainActivity extends SDLActivity{
 
     int integratedTouchState() { return TOUCH_STATE_READY | TOUCH_STATE_IN_GAME; }
 
-    int[] integratedTouchBindings(int mode) { return TouchBindings.defaults(mode); }
+    // Pushed from the native menu (BenMenu.cpp). Until it arrives the defaults apply.
+    private volatile int[] integratedBindingsFromMenu;   // 3 presets x 16 actions, preset 1 first
+    private volatile float[] integratedCameraFromMenu;   // {sensitivity, vertical multiplier, invert X, invert Y, smoothing}
 
-    /** {sensitivity, vertical multiplier, invert X, invert Y, smoothing} */
-    float[] integratedTouchCamera() { return new float[]{1f, 1f, 0f, 0f, 0f}; }
+    int[] integratedTouchBindings(int mode) {
+        int[] all = integratedBindingsFromMenu;
+        int n = TouchBindings.KEYS.length;
+        if (all == null || mode < 1 || mode > 3 || all.length < mode * n) return TouchBindings.defaults(mode);
+        return java.util.Arrays.copyOfRange(all, (mode - 1) * n, mode * n);
+    }
+
+    float[] integratedTouchCamera() {
+        float[] cfg = integratedCameraFromMenu;
+        return cfg != null && cfg.length >= 5 ? cfg : new float[]{1f, 1f, 0f, 0f, 0f};
+    }
 
     void integratedTouchLayout(float[] anchors, boolean active, boolean naviUtilityIcon) {
         // Item icons are drawn by the game itself in a later change.
@@ -1091,10 +1102,19 @@ public class MainActivity extends SDLActivity{
         updateIntegratedRightAxes();
     }
 
-    public void setIntegratedTouchFromNative(int mode, float scale, float opacity, boolean transparentSticks) {
+    public void setIntegratedTouchFromNative(int mode, float scale, float opacity, boolean transparentSticks,
+                                             boolean floatingRightStick) {
         preferences.edit().putInt("integratedTouchMode", Math.max(1, Math.min(3, mode)))
                 .putFloat("integratedTouchScale", scale).putFloat("integratedTouchOpacity", opacity)
-                .putBoolean("touchTransparentSticks", transparentSticks).apply();
+                .putBoolean("touchTransparentSticks", transparentSticks)
+                .putBoolean("touchRightStickFloating", floatingRightStick).apply();
+        runOnUiThread(this::applyTouchControlsVisibility);
+    }
+
+    /** Camera drag options and every preset's button assignments, in the layout described on the fields above. */
+    public void setIntegratedTouchExtrasFromNative(float[] camera, int[] bindings) {
+        integratedCameraFromMenu = camera;
+        integratedBindingsFromMenu = bindings;
         runOnUiThread(this::applyTouchControlsVisibility);
     }
 
@@ -1293,7 +1313,7 @@ public class MainActivity extends SDLActivity{
             if (mode < 1 || mode > 3) mode = 3;
             integratedTouchView.configure(mode, !touchControlsDisabled,
                     preferences.getBoolean(PREF_TOUCH_LEFT_STICK_FLOATING, true),
-                    true, // the camera touch area is always floating
+                    preferences.getBoolean("touchRightStickFloating", true),
                     preferences.getFloat("integratedTouchScale", 1),
                     preferences.getFloat("integratedTouchOpacity", .55f),
                     preferences.getBoolean("touchTransparentSticks", false));

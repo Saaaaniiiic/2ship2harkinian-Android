@@ -9,6 +9,7 @@
 #include "2s2h/Enhancements/GfxPatcher/AuthenticGfxPatches.h"
 #include "2s2h/PresetManager/PresetManager.h"
 #include "HudEditor.h"
+#include "TouchHudBindings.h"
 #include "Notification.h"
 #include "2s2h/Enhancements/Trackers/DisplayOverlay.h"
 #include <variant>
@@ -21,6 +22,8 @@
 #include "2s2h/Rando/Rando.h"
 #include "build.h"
 #include <algorithm>
+#include <array>
+#include <vector>
 #if defined(__ANDROID__)
 #include <jni.h>
 #include <SDL.h>
@@ -49,11 +52,50 @@ static std::unordered_map<int32_t, const char*> imguiScaleOptions = {
     { 3, "X-Large" },
 };
 #if defined(__ANDROID__)
-static const std::unordered_map<int32_t, const char*> touchFaceButtonLayoutMap = {
-    { 0, "ABXY (Nintendo)" },
-    { 1, "BAYX (Xbox)" },
-    { 2, "GC Layout" },
+static const std::vector<const char*> touchStyleOptions = { "N64", "GameCube", "Modern" };
+
+// Indexed by TouchHud::Action. Actions the game side cannot answer yet say so instead of silently doing nothing.
+static const std::vector<const char*> touchActionOptions = {
+    "Disabled",
+    "Action / A",
+    "Sword / B",
+    "Target / N64 Z",
+    "Shield / R",
+    "Tatl",
+    "Left item / C-left",
+    "Down item / C-down",
+    "Right item / C-right",
+    "Extra / N64 L",
+    "First-person / C-up",
+    "Pause / Start",
+    "D-pad up",
+    "D-pad down",
+    "D-pad left",
+    "D-pad right",
+    "Toggle map (not available yet)",
+    "Manual jump (not available yet)",
+    "Modifier 1 (not available yet)",
+    "Modifier 2 (not available yet)",
 };
+static_assert(TouchHud::ActionCount == 20, "touchActionOptions must list every TouchHud::Action");
+
+// Binding labels per preset (N64, GameCube, Modern), in TouchHud::Keys order. The last entry (Map) is not shown.
+static const char* const touchBindingLabels[3][TouchHud::BindingCount] = {
+    { "A", "B", "C-left", "C-down", "C-right", "C-up", "Z", "L", "R", "D-pad up", "D-pad down", "D-pad left",
+      "D-pad right", "Start", "Tatl / utility", "Map" },
+    { "A", "B", "Y", "Z", "X", "C-up", "L", "Extra", "R", "D-pad up", "D-pad down", "D-pad left", "D-pad right",
+      "Start", "Tatl / utility", "Map" },
+    { "A", "B", "X", "Y", "ZR", "Tatl", "ZL", "L", "R", "D-pad up", "D-pad down", "D-pad left", "D-pad right",
+      "Start", "Tatl / utility", "Map" },
+};
+
+// Last assignments seen by the overlay, so a change can swap two buttons instead of duplicating an action.
+static std::array<std::array<int, TouchHud::BindingCount>, 4> touchBindingSnapshot;
+
+// The style CVar stores the combobox index (0 N64, 1 GameCube, 2 Modern); the overlay numbers presets from 1.
+static int TouchStyle() {
+    return std::clamp(CVarGetInteger("gSettings.TouchControls.Style", 2), 0, 2) + 1;
+}
 
 static void ApplyAndroidMenuScale(float scale) {
     if (scale < 1.0f) {
@@ -91,24 +133,6 @@ static void SetAndroidTouchControlsDisabled(bool disabled) {
     env->DeleteLocalRef(activityClass);
 }
 
-static void SetAndroidTouchFaceButtonLayout(int32_t layout) {
-    JNIEnv* env = (JNIEnv*)SDL_AndroidGetJNIEnv();
-    jobject activity = (jobject)SDL_AndroidGetActivity();
-    if (env == nullptr || activity == nullptr) {
-        return;
-    }
-
-    jclass activityClass = env->GetObjectClass(activity);
-    if (activityClass != nullptr) {
-        jmethodID method =
-            env->GetMethodID(activityClass, "setTouchFaceButtonLayoutFromNative", "(I)V");
-        if (method != nullptr) {
-            env->CallVoidMethod(activity, method, static_cast<jint>(layout));
-        }
-        env->DeleteLocalRef(activityClass);
-    }
-}
-
 static void SetAndroidTouchLeftStickFloating(bool floating) {
     JNIEnv* env = (JNIEnv*)SDL_AndroidGetJNIEnv();
     jobject activity = (jobject)SDL_AndroidGetActivity();
@@ -124,6 +148,100 @@ static void SetAndroidTouchLeftStickFloating(bool floating) {
         }
         env->DeleteLocalRef(activityClass);
     }
+}
+
+// Sends the style, size, opacity, camera options and every preset's assignments to the Java overlay.
+static void PushAndroidIntegratedTouch() {
+    for (int style = 1; style <= 3; ++style) {
+        for (int i = 0; i < TouchHud::BindingCount; ++i) {
+            touchBindingSnapshot[style][i] =
+                CVarGetInteger(TouchHud::BindingCvar(style, i), TouchHud::DefaultAction(style, i));
+        }
+    }
+
+    JNIEnv* env = (JNIEnv*)SDL_AndroidGetJNIEnv();
+    jobject activity = (jobject)SDL_AndroidGetActivity();
+    if (env == nullptr || activity == nullptr) {
+        return;
+    }
+    jclass activityClass = env->GetObjectClass(activity);
+    if (activityClass != nullptr) {
+        jmethodID configure = env->GetMethodID(activityClass, "setIntegratedTouchFromNative", "(IFFZZ)V");
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        if (configure != nullptr) {
+            env->CallVoidMethod(
+                activity, configure, static_cast<jint>(TouchStyle()),
+                CVarGetFloat("gSettings.TouchControls.Scale", 1.0f),
+                CVarGetFloat("gSettings.TouchControls.Opacity", 0.55f),
+                static_cast<jboolean>(CVarGetInteger("gSettings.TouchControls.TransparentSticks", 0) != 0), JNI_TRUE);
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
+
+        jmethodID extras = env->GetMethodID(activityClass, "setIntegratedTouchExtrasFromNative", "([F[I)V");
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        if (extras != nullptr) {
+            jfloat camera[5] = {
+                CVarGetFloat("gSettings.TouchControls.Camera.Sensitivity", 1.0f),
+                CVarGetFloat("gSettings.TouchControls.Camera.SensitivityY", 1.0f),
+                CVarGetInteger("gSettings.TouchControls.Camera.InvertX", 0) != 0 ? 1.0f : 0.0f,
+                CVarGetInteger("gSettings.TouchControls.Camera.InvertY", 0) != 0 ? 1.0f : 0.0f,
+                CVarGetFloat("gSettings.TouchControls.Camera.Smoothing", 0.0f),
+            };
+            jint bindings[3 * TouchHud::BindingCount];
+            for (int style = 1; style <= 3; ++style) {
+                for (int i = 0; i < TouchHud::BindingCount; ++i) {
+                    bindings[(style - 1) * TouchHud::BindingCount + i] = touchBindingSnapshot[style][i];
+                }
+            }
+            jfloatArray cameraArray = env->NewFloatArray(5);
+            jintArray bindingArray = env->NewIntArray(3 * TouchHud::BindingCount);
+            if (cameraArray != nullptr && bindingArray != nullptr) {
+                env->SetFloatArrayRegion(cameraArray, 0, 5, camera);
+                env->SetIntArrayRegion(bindingArray, 0, 3 * TouchHud::BindingCount, bindings);
+                env->CallVoidMethod(activity, extras, cameraArray, bindingArray);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                }
+            }
+            if (cameraArray != nullptr) {
+                env->DeleteLocalRef(cameraArray);
+            }
+            if (bindingArray != nullptr) {
+                env->DeleteLocalRef(bindingArray);
+            }
+        }
+        env->DeleteLocalRef(activityClass);
+    }
+    env->DeleteLocalRef(activity);
+}
+
+static void EditAndroidIntegratedTouch() {
+    JNIEnv* env = (JNIEnv*)SDL_AndroidGetJNIEnv();
+    jobject activity = (jobject)SDL_AndroidGetActivity();
+    if (env == nullptr || activity == nullptr) {
+        return;
+    }
+    jclass activityClass = env->GetObjectClass(activity);
+    if (activityClass != nullptr) {
+        jmethodID method = env->GetMethodID(activityClass, "editIntegratedTouchFromNative", "()V");
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+        if (method != nullptr) {
+            env->CallVoidMethod(activity, method);
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(activityClass);
+    }
+    env->DeleteLocalRef(activity);
 }
 #endif
 
@@ -788,34 +906,148 @@ void BenMenu::AddSettings() {
     path.sidebarName = "Touch Controls";
     path.column = SECTION_COLUMN_1;
     AddSidebarEntry("Settings", "Touch Controls", 2);
-    AddWidget(path, "Touch Face Buttons", WIDGET_CVAR_COMBOBOX)
-        .CVar("gSettings.TouchControls.FaceButtonLayout")
-        .Callback([](WidgetInfo& info) {
-            SetAndroidTouchFaceButtonLayout(
-                CVarGetInteger("gSettings.TouchControls.FaceButtonLayout", 0));
-        })
+    AddWidget(path, "Touch Controller Style", WIDGET_CVAR_COMBOBOX)
+        .CVar("gSettings.TouchControls.Style")
+        .Callback([](WidgetInfo&) { PushAndroidIntegratedTouch(); })
         .Options(ComboboxOptions()
-                     .ComboMap(&touchFaceButtonLayoutMap)
-                     .DefaultIndex(0)
-                     .Tooltip("Choose ABXY (Nintendo), BAYX (Xbox), or GC Layout touch-button placement."));
-    SetAndroidTouchFaceButtonLayout(
-        CVarGetInteger("gSettings.TouchControls.FaceButtonLayout", 0));
+                     .ComboVec(&touchStyleOptions)
+                     .DefaultIndex(2)
+                     .Tooltip("N64, GameCube and Modern follow their console layouts."));
+    AddWidget(path, "Edit Touch Layout", WIDGET_BUTTON)
+        .Callback([](WidgetInfo&) { EditAndroidIntegratedTouch(); })
+        .Options(ButtonOptions().Tooltip("Move, resize and hide the touch buttons of the selected style."));
+    AddWidget(path, "Size: %.0f%%", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gSettings.TouchControls.Scale")
+        .Callback([](WidgetInfo&) { PushAndroidIntegratedTouch(); })
+        .Options(FloatSliderOptions()
+                     .Min(0.75f)
+                     .Max(1.5f)
+                     .DefaultValue(1.0f)
+                     .Format("")
+                     .ShowAdjustmentButtons(false)
+                     .IsPercentage()
+                     .Tooltip("Scales every touch button."));
+    AddWidget(path, "Opacity: %.0f%%", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gSettings.TouchControls.Opacity")
+        .Callback([](WidgetInfo&) { PushAndroidIntegratedTouch(); })
+        .Options(FloatSliderOptions()
+                     .Min(0.15f)
+                     .Max(1.0f)
+                     .DefaultValue(0.55f)
+                     .Format("")
+                     .ShowAdjustmentButtons(false)
+                     .IsPercentage()
+                     .Tooltip("How opaque the touch buttons are."));
     AddWidget(path, "Floating Left Stick", WIDGET_CVAR_CHECKBOX)
         .CVar("gSettings.TouchControls.FloatingLeftStick")
         .Callback([](WidgetInfo& info) {
-            SetAndroidTouchLeftStickFloating(
-                CVarGetInteger("gSettings.TouchControls.FloatingLeftStick", 1) != 0);
+            SetAndroidTouchLeftStickFloating(CVarGetInteger("gSettings.TouchControls.FloatingLeftStick", 1) != 0);
         })
         .Options(CheckboxOptions().DefaultValue(true).Tooltip(
             "When disabled, the left touch stick stays fixed in the lower-left corner."));
-    SetAndroidTouchLeftStickFloating(
-        CVarGetInteger("gSettings.TouchControls.FloatingLeftStick", 1) != 0);
+    AddWidget(path, "Transparent Sticks", WIDGET_CVAR_CHECKBOX)
+        .CVar("gSettings.TouchControls.TransparentSticks")
+        .Callback([](WidgetInfo&) { PushAndroidIntegratedTouch(); })
+        .Options(CheckboxOptions().Tooltip(
+            "Hides fixed stick backgrounds and outlines while keeping the small position indicators visible. "
+            "Floating sticks are always transparent. The layout editor still shows their bounds."));
     AddWidget(path, "Disable Touch Controls", WIDGET_CVAR_CHECKBOX)
         .CVar("gSettings.TouchControls.Disabled")
         .Callback([](WidgetInfo& info) {
             SetAndroidTouchControlsDisabled(CVarGetInteger("gSettings.TouchControls.Disabled", 0) != 0);
         })
-        .Options(CheckboxOptions().Tooltip("Hides the Android touch controls and eye button."));
+        .Options(CheckboxOptions().Tooltip("Hides the Android touch controls."));
+
+    // Touch camera: drag anywhere that is not a button. The overlay reads these at the start of each drag.
+    AddWidget(path, "Camera Sensitivity: %.2fx", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gSettings.TouchControls.Camera.Sensitivity")
+        .Callback([](WidgetInfo&) { PushAndroidIntegratedTouch(); })
+        .Options(FloatSliderOptions()
+                     .Min(0.2f)
+                     .Max(3.0f)
+                     .DefaultValue(1.0f)
+                     .Step(0.05f)
+                     .Format("%.2f")
+                     .Tooltip("How far the camera turns for each drag of your finger."));
+    AddWidget(path, "Camera Vertical Sensitivity: %.2fx", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gSettings.TouchControls.Camera.SensitivityY")
+        .Callback([](WidgetInfo&) { PushAndroidIntegratedTouch(); })
+        .Options(FloatSliderOptions()
+                     .Min(0.2f)
+                     .Max(3.0f)
+                     .DefaultValue(1.0f)
+                     .Step(0.05f)
+                     .Format("%.2f")
+                     .Tooltip("Extra multiplier for up and down drags, on top of Camera Sensitivity."));
+    AddWidget(path, "Camera Smoothing: %.2f", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gSettings.TouchControls.Camera.Smoothing")
+        .Callback([](WidgetInfo&) { PushAndroidIntegratedTouch(); })
+        .Options(FloatSliderOptions()
+                     .Min(0.0f)
+                     .Max(0.9f)
+                     .DefaultValue(0.0f)
+                     .Step(0.05f)
+                     .Format("%.2f")
+                     .Tooltip("Softens the camera so it eases to a stop. 0 follows the finger exactly."));
+    AddWidget(path, "Invert Camera Horizontal", WIDGET_CVAR_CHECKBOX)
+        .CVar("gSettings.TouchControls.Camera.InvertX")
+        .Callback([](WidgetInfo&) { PushAndroidIntegratedTouch(); })
+        .Options(CheckboxOptions().Tooltip("Reverses left and right camera drags."));
+    AddWidget(path, "Invert Camera Vertical", WIDGET_CVAR_CHECKBOX)
+        .CVar("gSettings.TouchControls.Camera.InvertY")
+        .Callback([](WidgetInfo&) { PushAndroidIntegratedTouch(); })
+        .Options(CheckboxOptions().Tooltip("Reverses up and down camera drags."));
+
+    path.column = SECTION_COLUMN_2;
+    AddWidget(path, "Touch Button Assignments", WIDGET_SEPARATOR_TEXT);
+    // Only the selected style's buttons are shown, so equal labels across styles never share a screen.
+    // The Map button (the last key) is left out until the game side can answer it.
+    for (int style = 1; style <= 3; ++style) {
+        for (int i = 0; i < TouchHud::BindingCount - 1; ++i) {
+            if (i == 14 && style != 2) {
+                continue; // only the GameCube preset has the extra Tatl / utility button
+            }
+            AddWidget(path, touchBindingLabels[style - 1][i], WIDGET_CVAR_COMBOBOX)
+                .CVar(TouchHud::BindingCvar(style, i))
+                .HideInSearch(true)
+                .PreFunc([style](WidgetInfo& info) { info.isHidden = TouchStyle() != style; })
+                .Callback([style, i](WidgetInfo&) {
+                    int chosen = CVarGetInteger(TouchHud::BindingCvar(style, i), TouchHud::DefaultAction(style, i));
+                    // Swap functions instead of silently duplicating an action on two buttons.
+                    if (chosen != TouchHud::Disabled) {
+                        for (int j = 0; j < TouchHud::BindingCount; ++j) {
+                            if (j != i && touchBindingSnapshot[style][j] == chosen) {
+                                CVarSetInteger(TouchHud::BindingCvar(style, j), touchBindingSnapshot[style][i]);
+                            }
+                        }
+                    }
+                    PushAndroidIntegratedTouch();
+                    Ship::Context::GetRawInstance()->GetWindow()->GetGui()->SaveConsoleVariablesNextFrame();
+                })
+                .Options(ComboboxOptions()
+                             .ComboVec(&touchActionOptions)
+                             .DefaultIndex(TouchHud::DefaultAction(style, i))
+                             .Tooltip("Touch-only assignment for this style. Choosing an action that is already "
+                                      "assigned swaps the two buttons. Physical controller bindings are unchanged."));
+        }
+    }
+    AddWidget(path, "Restore Default Assignments", WIDGET_BUTTON)
+        .Callback([](WidgetInfo&) {
+            int style = TouchStyle();
+            for (int i = 0; i < TouchHud::BindingCount; ++i) {
+                CVarSetInteger(TouchHud::BindingCvar(style, i), TouchHud::DefaultAction(style, i));
+            }
+            PushAndroidIntegratedTouch();
+            Ship::Context::GetRawInstance()->GetWindow()->GetGui()->SaveConsoleVariablesNextFrame();
+        })
+        .Options(ButtonOptions().Tooltip(
+            "Restores only the selected style's touch assignments. Positions, sizes and physical controllers "
+            "are unchanged."));
+
+    // Keep the Java overlay aligned with the saved CVars after a relaunch.
+    PushAndroidIntegratedTouch();
+    SetAndroidTouchLeftStickFloating(CVarGetInteger("gSettings.TouchControls.FloatingLeftStick", 1) != 0);
+    SetAndroidTouchControlsDisabled(CVarGetInteger("gSettings.TouchControls.Disabled", 0) != 0);
 #endif
 
     path.sidebarName = "Overlay";

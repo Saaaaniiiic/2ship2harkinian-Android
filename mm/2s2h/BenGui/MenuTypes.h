@@ -2,6 +2,7 @@
 #define MENUTYPES_H
 
 #include "UIWidgets.hpp"
+#include <functional>
 
 #include <fast/Fast3dWindow.h>
 
@@ -41,7 +42,8 @@ struct disabledInfo;
 using VoidFunc = void (*)();
 using DisableInfoFunc = bool (*)(disabledInfo&);
 using DisableVec = std::vector<DisableOption>;
-using WidgetFunc = void (*)(WidgetInfo&);
+// std::function, not a plain function pointer, so a widget can capture (the touch button assignments do).
+using WidgetFunc = std::function<void(WidgetInfo&)>;
 
 typedef enum {
     WIDGET_CHECKBOX,
